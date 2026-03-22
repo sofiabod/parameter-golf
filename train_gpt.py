@@ -74,6 +74,9 @@ class Hyperparameters:
     bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
+    # partial rope: apply rotary to first N dims of head_dim (0 = all)
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+
     # sliding window eval
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
@@ -633,6 +636,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -651,7 +655,9 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        # partial rope: only apply rotary to first rope_dims of head_dim
+        self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -661,8 +667,16 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if self.rope_dims < self.head_dim:
+            # partial rope: apply to first rope_dims, leave rest position-free
+            rd = self.rope_dims
+            q_rope = apply_rotary_emb(q[..., :rd], cos, sin)
+            k_rope = apply_rotary_emb(k[..., :rd], cos, sin)
+            q = torch.cat([q_rope, q[..., rd:]], dim=-1)
+            k = torch.cat([k_rope, k[..., rd:]], dim=-1)
+        else:
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -739,11 +753,12 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         layer_idx: int = 0,
+        rope_dims: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         # ln scale depth damping: deeper layers get smaller residual contributions
         depth_scale = 1.0 / math.sqrt(layer_idx + 1)
@@ -776,6 +791,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_hash_buckets: int = 0,
         bigram_dim: int = 128,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -800,6 +816,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     layer_idx=i,
+                    rope_dims=rope_dims,
                 )
                 for i in range(num_layers)
             ]
@@ -983,6 +1000,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_hash_buckets=args.bigram_hash_buckets,
         bigram_dim=args.bigram_dim,
+        rope_dims=args.rope_dims,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
