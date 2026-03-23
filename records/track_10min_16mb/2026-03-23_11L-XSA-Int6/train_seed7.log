@@ -1,0 +1,85 @@
+✓ Initialized. View run at 
+https://modal.com/apps/sentra/main/ap-Bt22xN8ORNFkqM2yxTdgTG
+✓ Created objects.
+├── 🔨 Created mount /Users/sonia/Documents/GitHub/parameter-golf/modal_train.py
+├── 🔨 Created mount train_gpt.py
+└── 🔨 Created function train.
+launching 8xh100 training...
+logs/modal_run.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:26993756
+mtp_num_heads:0 mtp_loss_weight:0.2 mtp_params:0
+XSA:last_4 active_layers:[7, 8, 9, 10]
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.035 head_lr:0.0 matrix_lr:0.025 scalar_lr:0.025
+train_batch_tokens:786432 train_seq_len:2048 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:7
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:6.9297 val_bpb:4.1041 train_time:0ms step_avg:0.02ms
+step:1/20000 train_loss:6.9305 train_time:243ms step_avg:243.41ms
+step:2/20000 train_loss:8.8335 train_time:344ms step_avg:172.20ms
+step:3/20000 train_loss:8.1100 train_time:445ms step_avg:148.43ms
+step:4/20000 train_loss:7.1445 train_time:547ms step_avg:136.64ms
+step:5/20000 train_loss:7.0219 train_time:648ms step_avg:129.63ms
+step:6/20000 train_loss:6.8875 train_time:746ms step_avg:124.25ms
+step:7/20000 train_loss:6.6940 train_time:845ms step_avg:120.67ms
+step:8/20000 train_loss:6.6062 train_time:943ms step_avg:117.84ms
+step:9/20000 train_loss:6.4036 train_time:1044ms step_avg:115.99ms
+step:10/20000 train_loss:6.1515 train_time:1142ms step_avg:114.19ms
+step:500/20000 train_loss:2.4046 train_time:50204ms step_avg:100.41ms
+step:1000/20000 train_loss:2.2751 train_time:100492ms step_avg:100.49ms
+step:1500/20000 train_loss:2.2197 train_time:150867ms step_avg:100.58ms
+step:2000/20000 train_loss:2.0594 train_time:201228ms step_avg:100.61ms
+step:2500/20000 train_loss:2.1621 train_time:251689ms step_avg:100.68ms
+step:3000/20000 train_loss:2.1424 train_time:302131ms step_avg:100.71ms
+step:3500/20000 train_loss:2.1504 train_time:352570ms step_avg:100.73ms
+step:4000/20000 train_loss:1.9411 train_time:402922ms step_avg:100.73ms
+step:4000/20000 val_loss:2.0320 val_bpb:1.2034 train_time:402928ms step_avg:100.73ms
+step:4500/20000 train_loss:2.0893 train_time:453305ms step_avg:100.73ms
+step:5000/20000 train_loss:2.0617 train_time:503661ms step_avg:100.73ms
+swa:start step:5300
+late_qat:enabled step:5430 scale:0.1499
+step:5500/20000 train_loss:1.9739 train_time:554261ms step_avg:100.77ms
+step:5952/20000 val_loss:1.9362 val_bpb:1.1467 train_time:600005ms step_avg:100.81ms
+stopping_early: wallclock_cap train_time:600005ms step:5952/20000
+peak memory allocated: 20672 MiB reserved: 20718 MiB
+ema:applying EMA weights
+DIAGNOSTIC post_ema val_loss:1.9348 val_bpb:1.1459 eval_time:2256ms
+Serialized model: 106178569 bytes
+Code size: 68079 bytes
+Serialized model int6+zstd: 15669222 bytes
+Total submission size int6+zstd: 15737301 bytes
+Total submission size int8+zlib: 15737301 bytes
+final_int6_roundtrip val_loss:1.9482 val_bpb:1.1538 eval_time:195371ms
+final_int6_roundtrip_exact val_loss:1.94822080 val_bpb:1.15384609
+final_int6_sliding_window val_loss:1.9082 val_bpb:1.1301 stride:64 eval_time:332736ms
+final_int6_sliding_window_exact val_loss:1.90819587 val_bpb:1.13014407
+final_int8_zlib_roundtrip_exact val_loss:1.90819587 val_bpb:1.13014407
+training finished with exit code: 0
+Stopping app - local entrypoint completed.
+Runner terminated.
+✓ App completed. View run at 
+https://modal.com/apps/sentra/main/ap-Bt22xN8ORNFkqM2yxTdgTG
