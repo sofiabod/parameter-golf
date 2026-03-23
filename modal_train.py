@@ -38,7 +38,7 @@ image = (
 @app.function(
     image=image,
     gpu="H100:8",
-    timeout=1800,
+    timeout=3600,
 )
 def train(env_overrides: dict[str, str] | None = None):
     """8xh100 training"""

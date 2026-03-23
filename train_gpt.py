@@ -1382,6 +1382,77 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # cosine pre-eval TTT (from PR #481/#486 — 30 epochs AdamW with cosine LR + per-layer LR)
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 30))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
+    if ttt_epochs > 0:
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        log0(f"ttt: starting {ttt_epochs} epochs, lr={ttt_lr}, cosine+perlayer")
+        # per-layer LR groups: 3x for MLP output projections, 0.5x for MLP input
+        proj_params, fc_params, other_params = [], [], []
+        for name, p in eval_model.named_parameters():
+            p.requires_grad_(True)
+            if "mlp.proj" in name:
+                proj_params.append(p)
+            elif "mlp.fc" in name:
+                fc_params.append(p)
+            else:
+                other_params.append(p)
+        ttt_opt = torch.optim.AdamW([
+            {"params": proj_params, "lr": ttt_lr * 3.0},
+            {"params": fc_params, "lr": ttt_lr * 0.5},
+            {"params": other_params, "lr": ttt_lr},
+        ], weight_decay=0.0)
+        total_val = val_tokens.numel() - 1
+        ttt_batch = 32
+        rank_tokens = total_val // world_size
+        rank_start = rank * rank_tokens
+        rank_end = rank_start + rank_tokens
+        steps_per_epoch = max(1, (rank_end - rank_start - args.train_seq_len) // (ttt_batch * args.train_seq_len))
+        total_steps = ttt_epochs * steps_per_epoch
+        global_step = 0
+        eval_model.train()
+        for ep in range(ttt_epochs):
+            ep_loss, ep_steps = 0.0, 0
+            for bs in range(rank_start, rank_end - args.train_seq_len, ttt_batch * args.train_seq_len):
+                be = min(bs + ttt_batch * args.train_seq_len + 1, rank_end + 1)
+                local = val_tokens[bs:be].to(device=device, dtype=torch.int64)
+                n = (local.numel() - 1) // args.train_seq_len
+                if n == 0:
+                    continue
+                x = local[:n * args.train_seq_len].reshape(n, args.train_seq_len)
+                y = local[1:n * args.train_seq_len + 1].reshape(n, args.train_seq_len)
+                # cosine LR schedule
+                progress = global_step / max(total_steps, 1)
+                cos_mul = 0.5 * (1.0 + math.cos(math.pi * progress))
+                for g in ttt_opt.param_groups:
+                    g["lr"] = g.get("initial_lr", g["lr"]) * cos_mul
+                if global_step == 0:
+                    for g in ttt_opt.param_groups:
+                        g["initial_lr"] = g["lr"]
+                ttt_opt.zero_grad()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = eval_model(x, y)
+                loss.backward()
+                # sync gradients across ranks
+                if distributed:
+                    for p in eval_model.parameters():
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                torch.nn.utils.clip_grad_norm_(eval_model.parameters(), 1.0)
+                ttt_opt.step()
+                ep_loss += loss.item()
+                ep_steps += 1
+                global_step += 1
+            if master_process and (ep + 1) % 5 == 0:
+                log0(f"ttt_epoch:{ep + 1}/{ttt_epochs} avg_loss:{ep_loss / max(ep_steps, 1):.4f}")
+        del ttt_opt
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        log0(f"ttt: completed in {1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
