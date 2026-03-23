@@ -45,11 +45,7 @@ def train(env_overrides: dict[str, str] | None = None):
     import os
     import subprocess
 
-    # try to install flash-attn at runtime (may timeout)
-    subprocess.run(
-        ["pip", "install", "flash-attn", "--no-build-isolation", "-q"],
-        capture_output=True, timeout=120,
-    )
+    pass  # flash-attn install removed — use SDPA
 
     os.chdir("/opt/parameter-golf")
 
