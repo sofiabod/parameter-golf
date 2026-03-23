@@ -23,11 +23,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+_HAS_FA3 = False
 try:
     from flash_attn_interface import flash_attn_func as flash_attn_3_func
     _HAS_FA3 = True
 except ImportError:
-    _HAS_FA3 = False
+    try:
+        from flash_attn import flash_attn_func as flash_attn_3_func
+        _HAS_FA3 = True
+    except ImportError:
+        pass
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
