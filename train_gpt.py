@@ -893,6 +893,76 @@ def eval_val_sliding(
     tokens_per_byte = token_count.item() / byte_count.item()
     base_model.train()
     return val_loss, bits_per_token * tokens_per_byte
+class LongPhraseCache:
+    """variable-length suffix matcher for verbatim repetition (PR #880).
+    probes at lengths [48,36,28,20,16] using rolling hashes."""
+    PROBE_LENGTHS = [48, 36, 28, 20, 16]
+    PRIMES = [np.uint64(p) for p in [
+        36313, 27191, 51647, 81929, 131071, 174763, 233017, 299993, 350377,
+        412391, 479909, 541267, 613651, 700897, 786433, 850001, 921587,
+        982451, 1048573, 1114111, 1179641, 1245169, 1310719, 1376257,
+        1441793, 1507321, 1572869, 1638391, 1703933, 1769473, 1835009,
+        1900543, 1966079, 2031617, 2097143, 2162689, 2228223, 2293759,
+        2359291, 2424833, 2490367, 2555903, 2621431, 2686979, 2752511,
+        2818049, 2883577, 2949121,
+    ]]  # 48 primes for longest probe
+    BUCKETS = 4194304
+    MASK = np.uint64(BUCKETS - 1)
+
+    def __init__(self):
+        self.ctx_tables = {L: np.zeros(self.BUCKETS, dtype=np.uint32) for L in self.PROBE_LENGTHS}
+        self.full_tables = {L: np.zeros(self.BUCKETS, dtype=np.uint32) for L in self.PROBE_LENGTHS}
+
+    def _rolling_hash(self, val_np: np.ndarray, positions: np.ndarray, length: int) -> np.ndarray:
+        h = np.zeros(len(positions), dtype=np.uint64)
+        for k in range(length):
+            toks = val_np[(positions - length + k).astype(np.int64)].astype(np.uint64)
+            h ^= toks * self.PRIMES[k]
+        return h
+
+    def build_full(self, val_np: np.ndarray, log_fn=None):
+        """build phrase cache from all tokens."""
+        n = len(val_np) - 1
+        for L in self.PROBE_LENGTHS:
+            if n <= L:
+                continue
+            positions = np.arange(L, n, dtype=np.int64)
+            ctx_hash = self._rolling_hash(val_np, positions, L)
+            ctx_key = (ctx_hash & self.MASK).astype(np.int64)
+            targets = val_np[positions + 1].astype(np.uint64)
+            full_key = ((ctx_hash ^ (targets * self.PRIMES[L % len(self.PRIMES)])) & self.MASK).astype(np.int64)
+            np.add.at(self.ctx_tables[L], ctx_key, 1)
+            np.add.at(self.full_tables[L], full_key, 1)
+            if log_fn:
+                log_fn(f"phrase_cache: length {L} done")
+
+    def lookup(self, val_np: np.ndarray, positions: np.ndarray, min_count: int = 2
+               ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """lookup phrase matches. returns (p_phrase, has_match, match_length)."""
+        n_pos = len(positions)
+        p_phrase = np.zeros(n_pos, dtype=np.float64)
+        has_match = np.zeros(n_pos, dtype=np.bool_)
+        match_length = np.zeros(n_pos, dtype=np.int32)
+        for L in self.PROBE_LENGTHS:  # longest first
+            valid = (positions >= L) & ~has_match
+            if not valid.any():
+                continue
+            pos_valid = positions[valid]
+            ctx_hash = self._rolling_hash(val_np, pos_valid, L)
+            ctx_key = (ctx_hash & self.MASK).astype(np.int64)
+            targets = val_np[(pos_valid + 1).astype(np.int64)].astype(np.uint64)
+            full_key = ((ctx_hash ^ (targets * self.PRIMES[L % len(self.PRIMES)])) & self.MASK).astype(np.int64)
+            ctx_c = self.ctx_tables[L][ctx_key]
+            full_c = np.minimum(self.full_tables[L][full_key], ctx_c)
+            eligible = (ctx_c >= min_count) & (full_c > 0)
+            if eligible.any():
+                valid_idx = np.where(valid)[0][eligible]
+                p_phrase[valid_idx] = full_c[eligible].astype(np.float64) / ctx_c[eligible].astype(np.float64)
+                has_match[valid_idx] = True
+                match_length[valid_idx] = L
+        return p_phrase, has_match, match_length
+
+
 class NgramCache:
     """n-gram cache matching PR #753/#769/#779: two flat uint32 arrays per order
     (ctx_counts, full_counts). hash context and full n-gram (context+target) separately."""
@@ -1319,11 +1389,28 @@ def eval_ngram_two_pass(
         raw_alpha = (ent_base + ent_range * sig) * mults
         alpha[matched_idx] = np.clip(raw_alpha, 0.0, 0.95)
 
-    # blend
+    # blend n-gram
     blended_p = all_model_p.copy()
     m = has_match
     if m.any():
         blended_p[m] = (1.0 - alpha[m]) * all_model_p[m] + alpha[m] * p_ngram[m]
+
+    # phrase cache: second layer of blending for long verbatim repetitions
+    if log_fn:
+        log_fn(f"two_pass: building phrase cache...")
+    phrase_cache = LongPhraseCache()
+    phrase_cache.build_full(val_np, log_fn=log_fn)
+    p_phrase, phrase_match, phrase_len = phrase_cache.lookup(val_np, all_positions, min_count=2)
+    if phrase_match.any():
+        # alpha based on match length: longer = higher trust (up to 0.99 for 48-token match)
+        base_alpha = 0.3
+        phrase_alpha = base_alpha + (0.99 - base_alpha) * (phrase_len[phrase_match].astype(np.float64) - 16.0) / 32.0
+        phrase_alpha = np.clip(phrase_alpha, 0.0, 0.99)
+        pm = phrase_match
+        blended_p[pm] = (1.0 - phrase_alpha) * blended_p[pm] + phrase_alpha * p_phrase[pm]
+        if log_fn:
+            log_fn(f"phrase_cache: {phrase_match.sum()} matches, mean_len={phrase_len[phrase_match].mean():.1f}")
+
     blended_p = np.maximum(blended_p, 1e-30)
     blended_nll = -np.log(blended_p)
 
@@ -1938,7 +2025,7 @@ def main() -> None:
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     sw_seq_len = effective_eval_seq_len
     if ngram_enabled:
-        ngram_order = int(os.environ.get("NGRAM_ORDER", "11"))
+        ngram_order = int(os.environ.get("NGRAM_ORDER", "9"))
         ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
         ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", "4194304"))
         ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", "2"))
