@@ -930,62 +930,55 @@ class NgramCache:
         hashes = hashes % self.num_buckets
         return hashes, valid
 
-    def score_and_update_chunked(self, token_ids: np.ndarray, chunk_size: int = 65536,
-                                  log_fn=None) -> tuple[np.ndarray, np.ndarray]:
-        """chunked score-first: score each chunk using prior chunks' counts, then update."""
+    def score_and_update_sequential(self, token_ids: np.ndarray,
+                                     log_fn=None) -> tuple[np.ndarray, np.ndarray]:
+        """truly sequential score-first: score position i using all counts from 0..i-1,
+        then update counts with position i's observation. uses precomputed hashes."""
         n = len(token_ids) - 1
         ngram_prob_target = np.zeros(n, dtype=np.float64)
         has_ngram = np.zeros(n, dtype=np.bool_)
-        targets = token_ids[1:n + 1].astype(np.int64)
+        tokens = token_ids.astype(np.int64)
+        targets = tokens[1:n + 1]
 
-        # precompute hashes for all orders
+        # precompute hashes for all orders (vectorized)
         all_hashes = []
         all_valid = []
         for order in range(self.min_order, self.max_order + 1):
-            hashes, valid = self._compute_hashes(token_ids[:n + 1], order)
+            hashes, valid = self._compute_hashes(tokens[:n + 1], order)
             all_hashes.append(hashes)
             all_valid.append(valid)
 
-        num_chunks = (n + chunk_size - 1) // chunk_size
-        for ci in range(num_chunks):
-            cs = ci * chunk_size
-            ce = min(cs + chunk_size, n)
-            chunk_targets = targets[cs:ce]
+        counts = self.counts
+        totals = self.totals
+        min_count = self.min_count
+        num_orders = self.num_orders
+
+        for pos in range(n):
+            target = int(targets[pos])
 
             # score: try highest order first, backoff
-            chunk_has = np.zeros(ce - cs, dtype=np.bool_)
-            for oi in range(self.num_orders - 1, -1, -1):
-                h = all_hashes[oi][cs:ce]
-                v = all_valid[oi][cs:ce]
-                mask = v & ~chunk_has
-                if not mask.any():
+            for oi in range(num_orders - 1, -1, -1):
+                if not all_valid[oi][pos]:
                     continue
-                h_masked = h[mask]
-                t_masked = chunk_targets[mask]
-                row_totals = self.totals[oi, h_masked]
-                has_enough = row_totals >= self.min_count
-                if not has_enough.any():
+                h = int(all_hashes[oi][pos])
+                tot = int(totals[oi, h])
+                if tot >= min_count:
+                    tc = int(counts[oi, h, target])
+                    if tc > 0:
+                        ngram_prob_target[pos] = tc / tot
+                        has_ngram[pos] = True
+                    break
+
+            # update all orders AFTER scoring
+            for oi in range(num_orders):
+                if not all_valid[oi][pos]:
                     continue
-                target_counts = self.counts[oi, h_masked, t_masked].astype(np.float64)
-                probs = np.zeros_like(target_counts)
-                probs[has_enough] = target_counts[has_enough] / row_totals[has_enough].astype(np.float64)
-                idx = np.where(mask)[0]
-                idx_valid = idx[has_enough]
-                ngram_prob_target[cs + idx_valid] = probs[has_enough]
-                has_ngram[cs + idx_valid] = True
-                chunk_has[idx_valid] = True
+                h = int(all_hashes[oi][pos])
+                counts[oi, h, target] += 1
+                totals[oi, h] += 1
 
-            # update counts for this chunk
-            for oi in range(self.num_orders):
-                h = all_hashes[oi][cs:ce]
-                v = all_valid[oi][cs:ce]
-                h_valid = h[v]
-                t_valid = chunk_targets[v]
-                np.add.at(self.counts[oi], (h_valid, t_valid), 1)
-                np.add.at(self.totals[oi], h_valid, 1)
-
-            if log_fn and (ci + 1) % 100 == 0:
-                log_fn(f"ngram: chunk {ci + 1}/{num_chunks}")
+            if log_fn and (pos + 1) % 10_000_000 == 0:
+                log_fn(f"ngram: {pos + 1}/{n} tokens processed")
 
         return ngram_prob_target, has_ngram
 
@@ -1106,8 +1099,8 @@ def eval_val_ngram(
                        num_buckets=ngram_buckets, min_count=ngram_min_count,
                        vocab_size=vocab_size)
     if log_fn:
-        log_fn(f"ngram: processing {total_tokens} tokens in chunks...")
-    ngram_prob_target, has_ngram = cache.score_and_update_chunked(all_tok_np, chunk_size=65536, log_fn=log_fn)
+        log_fn(f"ngram: processing {total_tokens} tokens sequentially...")
+    ngram_prob_target, has_ngram = cache.score_and_update_sequential(all_tok_np, log_fn=log_fn)
     if log_fn:
         log_fn(f"ngram: done, {has_ngram.sum()} positions with n-gram predictions")
 
