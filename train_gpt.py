@@ -53,10 +53,10 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -74,7 +74,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 32))
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
@@ -83,13 +83,13 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 6144))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))  # XSA on last 4 layers (0 = disabled)
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on all layers (PR #825)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.5))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
@@ -428,8 +428,8 @@ class CastedLinear(nn.Linear):
             with torch.no_grad():
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+                scale = (row_max / 15.0).clamp_min(1.0 / 15.0)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -15, 15) * scale[:, None]).to(x.dtype)
             w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -1131,7 +1131,7 @@ def _classify_param(name: str) -> str:
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
-def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
+def quantize_int6_per_row(t: Tensor, clip_range: int = 15) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         best_q, best_s, best_err = None, None, float('inf')
