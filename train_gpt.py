@@ -896,7 +896,7 @@ def eval_val_sliding(
 class NgramCache:
     """n-gram cache matching PR #753/#769/#779: two flat uint32 arrays per order
     (ctx_counts, full_counts). hash context and full n-gram (context+target) separately."""
-    PRIMES = [np.uint64(p) for p in [36313, 27191, 51647, 81929, 131071, 174763, 233017]]
+    PRIMES = [np.uint64(p) for p in [36313, 27191, 51647, 81929, 131071, 174763, 233017, 299993, 350377]]
 
     def __init__(self, max_order: int = 7, min_order: int = 2, num_buckets: int = 4194304,
                  min_count: int = 2, **kwargs):
@@ -910,32 +910,30 @@ class NgramCache:
         self.ctx_counts = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(self.num_orders)]
         self.full_counts = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(self.num_orders)]
 
-    def lookup(self, val_np: np.ndarray, start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
-        """score positions [start, end). returns (p_ngram, has_match) for the segment."""
+    def lookup(self, val_np: np.ndarray, start: int, end: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """score positions [start, end). returns (p_ngram, has_match, matched_order)."""
         seg_len = end - start
         p_ngram = np.zeros(seg_len, dtype=np.float64)
         has_match = np.zeros(seg_len, dtype=np.bool_)
+        matched_order = np.zeros(seg_len, dtype=np.int32)
         mask = self.mask
         primes = self.PRIMES
         # backoff: highest order first
         for oi in range(self.num_orders - 1, -1, -1):
             order = self.min_order + oi
             cw = order - 1
-            first_valid = max(cw, start) - start  # first position in segment with enough context
+            first_valid = max(cw, start) - start
             n_pos = seg_len - first_valid
             if n_pos <= 0:
                 continue
             abs_s = start + first_valid
-            # context hash
             ctx_hash = np.zeros(n_pos, dtype=np.uint64)
             for k in range(cw):
                 t = val_np[abs_s - cw + k:abs_s - cw + k + n_pos].astype(np.uint64)
                 ctx_hash ^= t * np.uint64(primes[k])
             ctx_key = (ctx_hash & mask).astype(np.int64)
-            # full hash: context + target
             targets = val_np[abs_s + 1:abs_s + 1 + n_pos].astype(np.uint64)
             full_key = ((ctx_hash ^ (targets * np.uint64(primes[cw]))) & mask).astype(np.int64)
-            # lookup
             ctx_c = self.ctx_counts[oi][ctx_key]
             full_c = self.full_counts[oi][full_key]
             valid = (ctx_c >= self.min_count) & (full_c > 0) & ~has_match[first_valid:first_valid + n_pos]
@@ -943,7 +941,8 @@ class NgramCache:
                 idx = np.nonzero(valid)[0]
                 p_ngram[first_valid + idx] = np.minimum(full_c[idx], ctx_c[idx]).astype(np.float64) / ctx_c[idx].astype(np.float64)
                 has_match[first_valid + idx] = True
-        return p_ngram, has_match
+                matched_order[first_valid + idx] = order
+        return p_ngram, has_match, matched_order
 
     def update(self, val_np: np.ndarray, start: int, end: int) -> None:
         """update cache with tokens from [start, end)."""
@@ -1014,6 +1013,18 @@ def eval_val_ngram(
     cache = NgramCache(max_order=ngram_order, min_order=ngram_min_order,
                        num_buckets=ngram_buckets, min_count=ngram_min_count)
 
+    # prefill: pre-warm cache with all tokens before this rank's first window (PR #796)
+    # this makes distributed eval equivalent to single-GPU sequential
+    if my_windows:
+        prefill_end = my_windows[0]
+        if prefill_end > 0:
+            chunk_sz = 65536
+            for pf_start in range(0, prefill_end, chunk_sz):
+                pf_end = min(pf_start + chunk_sz, prefill_end)
+                cache.update(val_np, pf_start, pf_end)
+            if log_fn:
+                log_fn(f"ngram_prefill: warmed cache with {prefill_end} tokens for rank {rank}")
+
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     loss_sum_neural = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1057,14 +1068,21 @@ def eval_val_ngram(
                 seg_nll_neural = F.cross_entropy(logits_f[i, s:wlen], seg_targets, reduction='none').cpu().numpy().astype(np.float64)
 
                 # n-gram: lookup THEN update (score-first)
-                p_ngram, has_match = cache.lookup(val_np, abs_start, abs_end)
+                p_ngram, has_match, matched_order = cache.lookup(val_np, abs_start, abs_end)
                 cache.update(val_np, abs_start, abs_end)
 
-                # alpha
+                # per-order entropy thresholds (PR #825)
+                ent_centers = {7: 3.0, 6: 3.2, 5: 3.5, 4: 3.8, 3: 4.2, 2: 4.5, 8: 2.8, 9: 2.6}
                 if adaptive:
                     seg_ent = (-(probs_all[i, s:wlen] * log_probs_all[i, s:wlen]).sum(dim=-1)).cpu().numpy()
-                    sig = 1.0 / (1.0 + np.exp(-ent_scale * (seg_ent - ent_thresh)))
-                    alpha = ent_base + ent_range * sig
+                    # per-position alpha based on matched order's entropy center
+                    alpha = np.full(seg_len, fixed_alpha, dtype=np.float64)
+                    for pos_idx in range(seg_len):
+                        if has_match[pos_idx]:
+                            order = int(matched_order[pos_idx])
+                            center = ent_centers.get(order, ent_thresh)
+                            sig = 1.0 / (1.0 + np.exp(-ent_scale * (seg_ent[pos_idx] - center)))
+                            alpha[pos_idx] = ent_base + ent_range * sig
                 else:
                     alpha = np.full(seg_len, fixed_alpha, dtype=np.float64)
 
@@ -1721,7 +1739,7 @@ def main() -> None:
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     sw_seq_len = effective_eval_seq_len
     if ngram_enabled:
-        ngram_order = int(os.environ.get("NGRAM_ORDER", "7"))
+        ngram_order = int(os.environ.get("NGRAM_ORDER", "9"))
         ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
         ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", "4194304"))
         ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", "2"))
