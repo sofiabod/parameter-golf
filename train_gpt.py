@@ -1938,7 +1938,7 @@ def main() -> None:
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     sw_seq_len = effective_eval_seq_len
     if ngram_enabled:
-        ngram_order = int(os.environ.get("NGRAM_ORDER", "15"))
+        ngram_order = int(os.environ.get("NGRAM_ORDER", "11"))
         ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
         ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", "4194304"))
         ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", "2"))
