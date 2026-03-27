@@ -1177,12 +1177,12 @@ def build_ngram_from_shards(data_path: str, max_order: int = 13, min_order: int 
             log_fn(f"ngram_build: shard {si+1}/{len(shard_files)}, {num_tokens/1e6:.1f}M tok, {time.perf_counter()-t_shard:.1f}s")
     if log_fn:
         log_fn(f"ngram_build: done. {len(shard_files)} shards, {total_tokens/1e9:.1f}B tokens, {num_buckets} buckets")
-    # cap at uint16 range, store as torch tensors (torch.save compatibility)
+    # cap at uint8 range for maximum bucket count within artifact budget
     packed = {}
     for oi in range(num_orders):
         order = min_order + oi
-        packed[f"ctx_{order}"] = torch.from_numpy(np.minimum(ctx_counts[oi], 65535).astype(np.uint16))
-        packed[f"full_{order}"] = torch.from_numpy(np.minimum(full_counts[oi], 65535).astype(np.uint16))
+        packed[f"ctx_{order}"] = torch.from_numpy(np.minimum(ctx_counts[oi], 255).astype(np.uint8))
+        packed[f"full_{order}"] = torch.from_numpy(np.minimum(full_counts[oi], 255).astype(np.uint8))
     packed["meta"] = torch.tensor([max_order, min_order, num_buckets], dtype=torch.int32)
     return packed
 
@@ -2033,7 +2033,7 @@ def main() -> None:
     if ngram_artifact_enabled:
         t_build = time.perf_counter()
         ngram_art_order = int(os.environ.get("NGRAM_ART_ORDER", "9"))
-        ngram_art_buckets = int(os.environ.get("NGRAM_ART_BUCKETS", "524288"))
+        ngram_art_buckets = int(os.environ.get("NGRAM_ART_BUCKETS", "2097152"))  # 2M buckets
         ngram_art_max_shards = int(os.environ.get("NGRAM_ART_MAX_SHARDS", "80"))
         # each rank builds from a subset of shards
         all_shards = sorted(glob.glob(os.path.join(args.data_path, "fineweb_train_*.bin")))
@@ -2243,7 +2243,7 @@ def main() -> None:
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     sw_seq_len = effective_eval_seq_len
     if ngram_enabled:
-        ngram_order = int(os.environ.get("NGRAM_ORDER", "9"))
+        ngram_order = int(os.environ.get("NGRAM_ORDER", "9"))  # match artifact order
         ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
         # use artifact bucket count if available, otherwise default
         art_buckets = int(prewarmed_ngram["meta"][2]) if prewarmed_ngram is not None else 4194304
