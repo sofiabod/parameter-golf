@@ -1177,12 +1177,20 @@ def build_ngram_from_shards(data_path: str, max_order: int = 13, min_order: int 
             log_fn(f"ngram_build: shard {si+1}/{len(shard_files)}, {num_tokens/1e6:.1f}M tok, {time.perf_counter()-t_shard:.1f}s")
     if log_fn:
         log_fn(f"ngram_build: done. {len(shard_files)} shards, {total_tokens/1e9:.1f}B tokens, {num_buckets} buckets")
-    # cap at uint8 range for maximum bucket count within artifact budget
+    # scale counts to preserve ratios within uint16 range
     packed = {}
     for oi in range(num_orders):
         order = min_order + oi
-        packed[f"ctx_{order}"] = torch.from_numpy(np.minimum(ctx_counts[oi], 255).astype(np.uint8))
-        packed[f"full_{order}"] = torch.from_numpy(np.minimum(full_counts[oi], 255).astype(np.uint8))
+        ctx = ctx_counts[oi].astype(np.float64)
+        full = full_counts[oi].astype(np.float64)
+        # scale by max(ctx) to preserve full/ctx ratios
+        max_ctx = ctx.max()
+        if max_ctx > 65535:
+            scale = 65535.0 / max_ctx
+            ctx = (ctx * scale).astype(np.uint32)
+            full = (full * scale).astype(np.uint32)
+        packed[f"ctx_{order}"] = torch.from_numpy(np.minimum(ctx, 65535).astype(np.uint16))
+        packed[f"full_{order}"] = torch.from_numpy(np.minimum(full, 65535).astype(np.uint16))
     packed["meta"] = torch.tensor([max_order, min_order, num_buckets], dtype=torch.int32)
     return packed
 
@@ -1315,13 +1323,10 @@ def eval_val_ngram(
 
                 # n-gram: score-first (lookup THEN update)
                 if dirichlet_concentration > 0:
-                    # flat Dirichlet mixing (best of exp71-73 sweep)
-                    p_ngram, has_match, matched_order, ng_ctx_c, ng_full_c = cache.lookup(val_np, abs_start, abs_end)
-                    blended_p = model_p.copy()
-                    if has_match.any():
-                        m = has_match
-                        conc = dirichlet_concentration
-                        blended_p[m] = (conc * model_p[m] + ng_full_c[m]) / (conc + ng_ctx_c[m])
+                    # hierarchical Dirichlet CTW mixing (PR #943 approach)
+                    blended_p = cache.lookup_hierarchical(val_np, abs_start, abs_end, dirichlet_concentration, model_p)
+                    # track hits for logging
+                    _, has_match, matched_order, _, _ = cache.lookup(val_np, abs_start, abs_end)
                 else:
                     p_ngram, has_match, matched_order, _, _ = cache.lookup(val_np, abs_start, abs_end)
                     # legacy linear interpolation with per-order entropy thresholds
@@ -2032,8 +2037,8 @@ def main() -> None:
     packed_ngram = None
     if ngram_artifact_enabled:
         t_build = time.perf_counter()
-        ngram_art_order = int(os.environ.get("NGRAM_ART_ORDER", "9"))
-        ngram_art_buckets = int(os.environ.get("NGRAM_ART_BUCKETS", "2097152"))  # 2M buckets
+        ngram_art_order = int(os.environ.get("NGRAM_ART_ORDER", "13"))
+        ngram_art_buckets = int(os.environ.get("NGRAM_ART_BUCKETS", "262144"))
         ngram_art_max_shards = int(os.environ.get("NGRAM_ART_MAX_SHARDS", "80"))
         # each rank builds from a subset of shards
         all_shards = sorted(glob.glob(os.path.join(args.data_path, "fineweb_train_*.bin")))
@@ -2243,7 +2248,7 @@ def main() -> None:
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     sw_seq_len = effective_eval_seq_len
     if ngram_enabled:
-        ngram_order = int(os.environ.get("NGRAM_ORDER", "9"))  # match artifact order
+        ngram_order = int(os.environ.get("NGRAM_ORDER", "13"))  # match artifact order
         ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
         # use artifact bucket count if available, otherwise default
         art_buckets = int(prewarmed_ngram["meta"][2]) if prewarmed_ngram is not None else 4194304
@@ -2254,7 +2259,7 @@ def main() -> None:
         ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", "0.90"))
         ngram_ent_scale = float(os.environ.get("NGRAM_ENT_SCALE", "2.0"))
         ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", "4.0"))
-        dirichlet_conc = float(os.environ.get("DIRICHLET_CONCENTRATION", "0.1"))
+        dirichlet_conc = float(os.environ.get("DIRICHLET_CONCENTRATION", "5.0"))
         torch.cuda.synchronize()
         t_ngram = time.perf_counter()
         ngram_two_pass = bool(int(os.environ.get("NGRAM_TWO_PASS", "0")))  # default single-pass for legality
