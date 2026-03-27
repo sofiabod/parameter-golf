@@ -49,14 +49,14 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 300.0))  # 5 min train, save 5 min for ngram build
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.5))
+    num_layers = int(os.environ.get("NUM_LAYERS", 2))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 2))
+    model_dim = int(os.environ.get("MODEL_DIM", 128))
+    num_heads = int(os.environ.get("NUM_HEADS", 4))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -83,14 +83,14 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on all layers (PR #825)
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 64))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))  # disabled for tiny model
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.5))
-    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
+    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
@@ -1125,6 +1125,56 @@ class NgramCache:
             np.add.at(self.full_counts[oi], full_key, 1)
 
 
+def build_ngram_from_shards(data_path: str, max_order: int = 13, min_order: int = 2,
+                            num_buckets: int = 524288, log_fn=None) -> dict:
+    """build n-gram hash tables from ALL training shards.
+    returns dict of numpy arrays to store in artifact."""
+    shard_pattern = os.path.join(data_path, "fineweb_train_*.bin")
+    shard_files = sorted(glob.glob(shard_pattern))
+    if not shard_files:
+        raise FileNotFoundError(f"No training shards: {shard_pattern}")
+    num_orders = max_order - min_order + 1
+    mask = np.uint64(num_buckets - 1)
+    primes = NgramCache.PRIMES
+    # use uint32 during building, convert to uint16 for storage
+    ctx_counts = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(num_orders)]
+    full_counts = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(num_orders)]
+    total_tokens = 0
+    for si, shard_file in enumerate(shard_files):
+        header = np.fromfile(shard_file, dtype="<i4", count=256)
+        num_tokens = int(header[2])
+        tokens = np.fromfile(shard_file, dtype="<u2", count=num_tokens,
+                             offset=256 * np.dtype("<i4").itemsize)
+        total_tokens += num_tokens
+        for oi in range(num_orders):
+            order = min_order + oi
+            cw = order - 1
+            if num_tokens <= cw + 1:
+                continue
+            n_pos = num_tokens - cw - 1
+            ctx_hash = np.zeros(n_pos, dtype=np.uint64)
+            for k in range(cw):
+                t = tokens[cw - cw + k:cw - cw + k + n_pos].astype(np.uint64)
+                ctx_hash ^= t * np.uint64(primes[k])
+            ctx_key = (ctx_hash & mask).astype(np.int64)
+            targets = tokens[cw + 1:cw + 1 + n_pos].astype(np.uint64)
+            full_key = ((ctx_hash ^ (targets * np.uint64(primes[cw]))) & mask).astype(np.int64)
+            np.add.at(ctx_counts[oi], ctx_key, 1)
+            np.add.at(full_counts[oi], full_key, 1)
+        if log_fn and (si + 1) % 10 == 0:
+            log_fn(f"ngram_build: {si+1}/{len(shard_files)} shards, {total_tokens/1e9:.1f}B tokens")
+    if log_fn:
+        log_fn(f"ngram_build: done. {len(shard_files)} shards, {total_tokens/1e9:.1f}B tokens, {num_buckets} buckets")
+    # cap at uint16 range for compact storage
+    packed = {}
+    for oi in range(num_orders):
+        order = min_order + oi
+        packed[f"ctx_{order}"] = np.minimum(ctx_counts[oi], 65535).astype(np.uint16)
+        packed[f"full_{order}"] = np.minimum(full_counts[oi], 65535).astype(np.uint16)
+    packed["meta"] = np.array([max_order, min_order, num_buckets], dtype=np.int32)
+    return packed
+
+
 def eval_val_ngram(
     args: Hyperparameters,
     model: nn.Module,
@@ -1148,6 +1198,7 @@ def eval_val_ngram(
     ent_scale: float = 2.0,
     ent_thresh: float = 4.0,
     dirichlet_concentration: float = 0.0,
+    prewarmed_ngram: dict | None = None,
     log_fn=None,
 ) -> tuple[float, float]:
     """sliding window eval with n-gram cache, matching PR #753/#769/#779.
@@ -1172,6 +1223,26 @@ def eval_val_ngram(
     compiled_logits = torch.compile(model.forward_logits, dynamic=False, fullgraph=True)
     cache = NgramCache(max_order=ngram_order, min_order=ngram_min_order,
                        num_buckets=ngram_buckets, min_count=ngram_min_count)
+
+    # load pre-warmed n-gram tables from artifact if available
+    if prewarmed_ngram is not None:
+        meta = prewarmed_ngram["meta"]
+        art_max_order = int(meta[0])
+        art_min_order = int(meta[1])
+        art_buckets = int(meta[2])
+        if art_buckets == ngram_buckets:
+            for oi in range(cache.num_orders):
+                order = cache.min_order + oi
+                ctx_key = f"ctx_{order}"
+                full_key = f"full_{order}"
+                if ctx_key in prewarmed_ngram and full_key in prewarmed_ngram:
+                    cache.ctx_counts[oi] = prewarmed_ngram[ctx_key].astype(np.uint32)
+                    cache.full_counts[oi] = prewarmed_ngram[full_key].astype(np.uint32)
+            if log_fn:
+                log_fn(f"prewarmed: loaded training n-gram tables (orders {art_min_order}-{art_max_order}, {art_buckets} buckets)")
+        else:
+            if log_fn:
+                log_fn(f"prewarmed: SKIPPED (bucket mismatch: artifact={art_buckets} vs eval={ngram_buckets})")
 
     # phrase cache (single-pass score-first, same as n-gram)
     phrase_cache = LongPhraseCache()
@@ -1943,6 +2014,21 @@ def main() -> None:
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
     if excluded_mtp > 0:
         log0(f"export_excluding_mtp_params:{excluded_mtp}")
+
+    # build packed n-gram tables from training data (on rank 0 only)
+    ngram_artifact_enabled = bool(int(os.environ.get("NGRAM_ARTIFACT", "1")))
+    packed_ngram = None
+    if ngram_artifact_enabled and master_process:
+        t_build = time.perf_counter()
+        ngram_art_order = int(os.environ.get("NGRAM_ART_ORDER", "13"))
+        ngram_art_buckets = int(os.environ.get("NGRAM_ART_BUCKETS", "524288"))
+        log0(f"ngram_artifact: building from training shards, order={ngram_art_order}, buckets={ngram_art_buckets}")
+        packed_ngram = build_ngram_from_shards(
+            args.data_path, max_order=ngram_art_order, min_order=2,
+            num_buckets=ngram_art_buckets, log_fn=log0,
+        )
+        log0(f"ngram_artifact: built in {time.perf_counter() - t_build:.0f}s")
+
     if master_process:
         torch.save(export_sd, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
@@ -1951,8 +2037,12 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+    # pack model + n-gram tables into single artifact
+    artifact_dict = {"w": quant_result, "m": quant_meta}
+    if packed_ngram is not None:
+        artifact_dict["ngram"] = packed_ngram
     quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+    torch.save(artifact_dict, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw) if _COMPRESSOR == "zstd" else zlib.compress(quant_raw, 9)
     if master_process:
@@ -1962,7 +2052,9 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
         log0(f"Total submission size int6+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        if packed_ngram is not None:
+            ngram_bytes = sum(v.nbytes for v in packed_ngram.values())
+            log0(f"ngram_artifact: raw={ngram_bytes} bytes ({ngram_bytes/1e6:.1f}MB)")
     if distributed:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:
@@ -2112,13 +2204,22 @@ def main() -> None:
             log0(f"legal_ttt_exact val_loss:{ll:.8f} val_bpb:{bb:.8f}")
         del to; torch.cuda.empty_cache()
 
+    # load pre-warmed n-gram tables from artifact (if present)
+    prewarmed_ngram = quant_state.get("ngram", None)
+    if prewarmed_ngram is not None:
+        log0(f"ngram_artifact: loaded pre-warmed tables from artifact")
+        meta = prewarmed_ngram["meta"]
+        log0(f"ngram_artifact: orders {int(meta[1])}-{int(meta[0])}, buckets={int(meta[2])}")
+
     # n-gram cache eval (includes sliding window — replaces standalone sw eval)
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     sw_seq_len = effective_eval_seq_len
     if ngram_enabled:
         ngram_order = int(os.environ.get("NGRAM_ORDER", "13"))
         ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
-        ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", "4194304"))
+        # use artifact bucket count if available, otherwise default
+        art_buckets = int(prewarmed_ngram["meta"][2]) if prewarmed_ngram is not None else 4194304
+        ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", str(art_buckets)))
         ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", "2"))
         ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.2"))
         ngram_ent_base = float(os.environ.get("NGRAM_ENT_BASE", "0.05"))
@@ -2154,6 +2255,7 @@ def main() -> None:
                 fixed_alpha=ngram_alpha,
                 ent_base=ngram_ent_base, ent_range=ngram_ent_range,
                 dirichlet_concentration=dirichlet_conc,
+                prewarmed_ngram=prewarmed_ngram,
                 ent_scale=ngram_ent_scale, ent_thresh=ngram_ent_thresh,
                 log_fn=log0,
             )
