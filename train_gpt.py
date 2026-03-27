@@ -896,7 +896,7 @@ def eval_val_sliding(
 class LongPhraseCache:
     """variable-length suffix matcher for verbatim repetition (PR #880).
     probes at lengths [48,36,28,20,16] using rolling hashes."""
-    PROBE_LENGTHS = [48, 36, 28, 20, 16]  # full probe set (matching PR #880)
+    PROBE_LENGTHS = [36, 28, 20, 16]  # trimmed to fit with order-13
     PRIMES = [np.uint64(p) for p in [
         36313, 27191, 51647, 81929, 131071, 174763, 233017, 299993, 350377,
         412391, 479909, 541267, 613651, 700897, 786433, 850001, 921587,
@@ -2116,7 +2116,7 @@ def main() -> None:
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     sw_seq_len = effective_eval_seq_len
     if ngram_enabled:
-        ngram_order = int(os.environ.get("NGRAM_ORDER", "9"))
+        ngram_order = int(os.environ.get("NGRAM_ORDER", "13"))
         ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
         ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", "4194304"))
         ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", "2"))
