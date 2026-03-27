@@ -1412,12 +1412,14 @@ def eval_ngram_two_pass(
     ent_range: float = 0.55,
     ent_scale: float = 2.0,
     ent_thresh: float = 4.0,
+    dirichlet_concentration: float = 0.0,
+    prewarmed_ngram: dict | None = None,
     log_fn=None,
 ) -> tuple[float, float]:
-    """two-pass n-gram eval (PR #870 BROADSIDE approach).
+    """two-pass n-gram eval (PR #870/#943 approach).
     pass 1: store model_p + entropy per scored position.
-    build full cache from all val tokens.
-    pass 2: rescore all positions with full cache."""
+    build full cache from all val tokens (+ merge with pre-warmed artifact tables).
+    pass 2: rescore all positions with full cache using hierarchical Dirichlet."""
     total_tokens = val_tokens.numel() - 1
     seq_len = eval_seq_len
     val_np = val_tokens[:total_tokens + 1].numpy()
@@ -1497,74 +1499,64 @@ def eval_ngram_two_pass(
         neural_bpb = (neural_loss / math.log(2.0)) * (len(all_model_p) / all_bytes.sum())
         log_fn(f"two_pass: pass 1 done, {len(all_model_p)} positions, neural_bpb={neural_bpb:.4f}")
 
-    # build full cache from ALL val tokens
+    # build full cache from ALL val tokens (+ merge with pre-warmed artifact)
     if log_fn:
         log_fn(f"two_pass: building full cache ({total_tokens} tokens, {ngram_order}-gram, {ngram_buckets} buckets)")
     cache = NgramCache(max_order=ngram_order, min_order=ngram_min_order,
                        num_buckets=ngram_buckets, min_count=ngram_min_count)
-    cache.build_full(val_np, log_fn=log_fn)
+    # load pre-warmed tables from artifact if available
+    if prewarmed_ngram is not None:
+        meta = prewarmed_ngram["meta"]
+        art_buckets = int(meta[2])
+        if art_buckets == ngram_buckets:
+            for oi in range(cache.num_orders):
+                order = cache.min_order + oi
+                ctx_key = f"ctx_{order}"
+                full_key = f"full_{order}"
+                if ctx_key in prewarmed_ngram:
+                    cache.ctx_counts[oi] = prewarmed_ngram[ctx_key].numpy().astype(np.uint32).copy()
+                    cache.full_counts[oi] = prewarmed_ngram[full_key].numpy().astype(np.uint32).copy()
+            if log_fn:
+                log_fn(f"two_pass: pre-warmed with training n-gram tables")
+    cache.build_full(val_np, log_fn=log_fn)  # add val tokens ON TOP of pre-warmed
 
     # pass 2: rescore all stored positions using full cache
     if log_fn:
         log_fn(f"two_pass: pass 2 — rescoring {len(all_positions)} positions with full cache")
 
-    # lookup n-gram probs for all stored positions (vectorized per order)
+    # pass 2: hierarchical Dirichlet CTW scoring over all positions
     n_pos = len(all_positions)
-    p_ngram = np.zeros(n_pos, dtype=np.float64)
-    has_match = np.zeros(n_pos, dtype=np.bool_)
-    matched_order = np.zeros(n_pos, dtype=np.int32)
+    conc = dirichlet_concentration if dirichlet_concentration > 0 else 5.0
+    blended_p = all_model_p.copy()
     mask = cache.mask
     primes = cache.PRIMES
+    has_match = np.zeros(n_pos, dtype=np.bool_)
 
-    for oi in range(cache.num_orders - 1, -1, -1):
+    # iterate lowest to highest order — hierarchical CTW
+    for oi in range(cache.num_orders):
         order = cache.min_order + oi
         cw = order - 1
-        # positions with enough context
-        valid = (all_positions >= cw) & ~has_match
+        valid = (all_positions >= cw)
         if not valid.any():
             continue
         pos_valid = all_positions[valid]
-        # context hash
         ctx_hash = np.zeros(len(pos_valid), dtype=np.uint64)
         for k in range(cw):
             t = val_np[(pos_valid - cw + k).astype(np.int64)].astype(np.uint64)
             ctx_hash ^= t * np.uint64(primes[k])
         ctx_key = (ctx_hash & mask).astype(np.int64)
-        # full hash
         targets = val_np[(pos_valid + 1).astype(np.int64)].astype(np.uint64)
         full_key = ((ctx_hash ^ (targets * np.uint64(primes[cw]))) & mask).astype(np.int64)
-        # lookup
         ctx_c = cache.ctx_counts[oi][ctx_key]
         full_c = np.minimum(cache.full_counts[oi][full_key], ctx_c)
         eligible = (ctx_c >= ngram_min_count) & (full_c > 0)
         if eligible.any():
             valid_idx = np.where(valid)[0][eligible]
-            p_ngram[valid_idx] = full_c[eligible].astype(np.float64) / ctx_c[eligible].astype(np.float64)
+            fc = full_c[eligible].astype(np.float64)
+            cc = ctx_c[eligible].astype(np.float64)
+            prev_p = blended_p[valid_idx]
+            blended_p[valid_idx] = (conc * prev_p + fc) / (conc + cc)
             has_match[valid_idx] = True
-            matched_order[valid_idx] = order
-
-    # per-order multipliers: boost higher orders, suppress low orders (PR #870/#782)
-    order_mults = {2: 0.3, 3: 0.3, 4: 0.7, 5: 1.0, 6: 1.5, 7: 2.0, 8: 2.0, 9: 2.0,
-                   10: 2.0, 11: 2.0, 12: 2.0, 13: 2.0, 14: 2.0, 15: 2.0}
-
-    # compute per-position alpha with per-order entropy thresholds + multipliers
-    alpha = np.full(n_pos, 0.05, dtype=np.float64)
-    matched_idx = np.where(has_match)[0]
-    if len(matched_idx) > 0:
-        orders = matched_order[matched_idx]
-        entropies = all_entropy[matched_idx]
-        # vectorized: compute centers and multipliers
-        centers = np.array([ent_centers.get(int(o), ent_thresh) for o in orders])
-        mults = np.array([order_mults.get(int(o), 1.0) for o in orders])
-        sig = 1.0 / (1.0 + np.exp(-ent_scale * (entropies - centers)))
-        raw_alpha = (ent_base + ent_range * sig) * mults
-        alpha[matched_idx] = np.clip(raw_alpha, 0.0, 0.95)
-
-    # blend n-gram
-    blended_p = all_model_p.copy()
-    m = has_match
-    if m.any():
-        blended_p[m] = (1.0 - alpha[m]) * all_model_p[m] + alpha[m] * p_ngram[m]
 
     # phrase cache: second layer of blending for long verbatim repetitions
     if log_fn:
@@ -2254,7 +2246,7 @@ def main() -> None:
         dirichlet_conc = float(os.environ.get("DIRICHLET_CONCENTRATION", "5.0"))
         torch.cuda.synchronize()
         t_ngram = time.perf_counter()
-        ngram_two_pass = bool(int(os.environ.get("NGRAM_TWO_PASS", "0")))  # default single-pass for legality
+        ngram_two_pass = bool(int(os.environ.get("NGRAM_TWO_PASS", "1")))  # two-pass full rescore (PR #943 approach)
         log0(f"ngram_eval: order={ngram_order} min_order={ngram_min_order} buckets={ngram_buckets} two_pass={ngram_two_pass} dirichlet={dirichlet_conc}")
         if ngram_two_pass:
             ng_val_loss, ng_val_bpb = eval_ngram_two_pass(
@@ -2263,10 +2255,12 @@ def main() -> None:
                 eval_seq_len=sw_seq_len if args.eval_stride > 0 else effective_eval_seq_len,
                 stride=args.eval_stride if args.eval_stride > 0 else effective_eval_seq_len,
                 ngram_order=ngram_order, ngram_min_order=ngram_min_order,
-                ngram_buckets=16777216,
+                ngram_buckets=ngram_buckets,
                 ngram_min_count=ngram_min_count,
                 ent_base=ngram_ent_base, ent_range=ngram_ent_range,
                 ent_scale=ngram_ent_scale, ent_thresh=ngram_ent_thresh,
+                dirichlet_concentration=dirichlet_conc,
+                prewarmed_ngram=prewarmed_ngram,
                 log_fn=log0,
             )
         else:
