@@ -2246,7 +2246,7 @@ def main() -> None:
         dirichlet_conc = float(os.environ.get("DIRICHLET_CONCENTRATION", "5.0"))
         torch.cuda.synchronize()
         t_ngram = time.perf_counter()
-        ngram_two_pass = bool(int(os.environ.get("NGRAM_TWO_PASS", "1")))  # two-pass full rescore (PR #943 approach)
+        ngram_two_pass = bool(int(os.environ.get("NGRAM_TWO_PASS", "0")))  # single-pass only (two-pass has self-inclusion leak)
         log0(f"ngram_eval: order={ngram_order} min_order={ngram_min_order} buckets={ngram_buckets} two_pass={ngram_two_pass} dirichlet={dirichlet_conc}")
         if ngram_two_pass:
             ng_val_loss, ng_val_bpb = eval_ngram_two_pass(
